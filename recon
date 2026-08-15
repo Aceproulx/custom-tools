@@ -1,0 +1,137 @@
+#!/bin/bash
+# ==============================================================================
+# recon — terminal reconnaissance tool
+# ------------------------------------------------------------------------------
+# Usage:
+#   recon --target tesla.com                # wildcard subdomain + passive recon
+#   recon --target tesla.com --active       # same + nuclei scanning
+#   recon --target shop.tesla.com --domain  # single domain, no wildcard enum
+# ==============================================================================
+
+TARGET=""
+DOMAIN_MODE=false
+ACTIVE=false
+
+usage() {
+    cat <<'EOF'
+Usage: recon [OPTIONS]
+
+Options:
+  --target <domain>   Target domain (required)
+  --domain            Treat --target as a single domain/host; skip wildcard
+                      subdomain enumeration
+  --active            Run nuclei scanning (severity + CVE template sets)
+  -h, --help          Show this help
+
+Examples:
+  recon --target tesla.com
+  recon --target tesla.com --active
+  recon --target shop.tesla.com --domain
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target)
+            TARGET="$2"
+            shift 2
+            ;;
+        --domain)
+            DOMAIN_MODE=true
+            shift
+            ;;
+        --active)
+            ACTIVE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "recon: unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$TARGET" ]]; then
+    echo "recon: --target is required" >&2
+    usage
+    exit 1
+fi
+
+# ==============================================================================
+# WILDCARD SUBDOMAIN ENUMERATION
+# REMOVE ALL THIS BLOCK IF THE DOMAIN IS NOT WILDCARD
+# ==============================================================================
+if [[ "$DOMAIN_MODE" == false ]]; then
+    echo "[*] wildcard mode: enumerating subdomains of $TARGET"
+
+    subfinder -d "$TARGET" -all -recursive | tee subfinder.txt
+    shodanx subdomain -d "$TARGET" -o shodanx.txt
+    assetfinder --subs-only "$TARGET" | grep "\.$TARGET" | tee -a assetfinder.txt
+    # amass enum -active -norecursive -d "$TARGET" | grep "\.$TARGET" | awk '{print $1}' | tee amass.txt
+    # gobuster dns -domain "$TARGET" -w /mnt/d/Downloads/Documents/subdomain_megalist.txt -o gobuster_subs.txt && cat gobuster_subs.txt | awk '{print $1}' | tee gobuster.txt
+
+    cat subfinder.txt amass.txt shodanx.txt assetfinder.txt gobuster.txt 2>/dev/null | sort -u | grep "\.$TARGET" | tee -a "subs_${TARGET}.txt"
+    rm -f subfinder.txt amass.txt shodanx.txt assetfinder.txt gobuster.txt
+
+    curl -s "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | grep -Po '(\w+\.\w.\w+)$' | anew crtsh_subdomains.txt
+    curl -s "https://otx.alienvault.com/api/v1/indicators/hostname/$TARGET/passive_dns" | jq -r '.passive_dns[]?.hostname' | sort -u | tee -a alienvault_subs.txt
+    curl -s "https://urlscan.io/api/v1/search/?q=domain:$TARGET&size=10000" | jq -r '.results[]?.page?.domain' | sort -u | tee urlscan_subs.txt
+    curl -s "https://www.virustotal.com/vtapi/v2/domain/report?apikey=$VT_KEY&domain=$TARGET" | jq -r '.subdomains[]' | tee virustotal.txt
+
+    cat "subs_${TARGET}.txt" alienvault_subs.txt virustotal.txt urlscan_subs.txt crtsh_subdomains.txt 2>/dev/null | sort -u | grep "$TARGET" | tee -a all_subdomains.txt
+    rm -f "subs_${TARGET}.txt" crtsh_subdomains.txt alienvault_subs.txt urlscan_subs.txt virustotal.txt
+else
+    # ==========================================================================
+    # SINGLE-DOMAIN MODE — replace the whole wildcard block above with this
+    # ==========================================================================
+    echo "[*] single-domain mode: $TARGET"
+    echo "$TARGET" > all_subdomains.txt
+fi
+
+# ==============================================================================
+# ALIVE HOSTS + PASSIVE URL GATHERING (always runs)
+# ==============================================================================
+httpx -l all_subdomains.txt -td -title -sc -ip -threads 200 -o httpx_findings.txt
+cat httpx_findings.txt | grep -Ei 'old|asp|php|jsp|jspx|aspx' | tee subs-commonly-wth-vulns.txt
+cat httpx_findings.txt | awk '{print $1}' | tee hosts_alive.txt
+cat hosts_alive.txt | grep -E "admin|panel|portal|secure|dashboard|internal|api" | tee important_subdomains.txt
+
+waymore -i "$TARGET" -mode U -oU waymore.txt
+cat hosts_alive.txt | gau | tee gaurls.txt
+cat hosts_alive.txt | gauplus -subs -b png,jpg,gif,jpeg,swf,woff,gif,svg -o gauplus.txt
+katana -list hosts_alive.txt -d 7 | tee katana.txt
+cat gauplus.txt gaurls.txt katana.txt waymore.txt | anew all_urls.txt && rm gauplus.txt gaurls.txt katana.txt waymore.txt
+
+cat all_urls.txt | grep -E ".php|.asp|.aspx|.jspx|.jsp" | tee urls_common_with-vulns.txt
+
+mkdir -p vuln_patterns
+cat all_urls.txt | gf ssrf | uro | tee vuln_patterns/ssrf_urls.txt
+cat all_urls.txt | grep -Pi "returnUrl=|continue=|dest=|destination=|forward=|go=|goto=|login\?to=|login_url=|logout=|next=|next_page=|out=|g=|redir=|redirect=|redirect_to=|redirect_uri=|redirect_url=|return=|returnTo=|return_path=|return_to=|return_url=|rurl=|site=|target=|to=|uri=|url=|qurl=|rit_url=|jump=|jump_url=|originUrl=|origin=|Url=|desturl=|u=|Redirect=|location=|ReturnUrl=|redirect_url=|redirect_to=|forward_to=|forward_url=|destination_url=|jump_to=|go_to=|goto_url=|target_url=|redirect_link=" | tee vuln_patterns/redirect_params.txt
+cat all_urls.txt | gf redirect | uro | sort -u | anew vuln_patterns/redirect_params.txt
+cat all_urls.txt | gf lfi | uro | tee vuln_patterns/lfi_urls.txt
+cat all_urls.txt | gf xss | uro | tee vuln_patterns/xss_urls.txt
+
+grep -oE '(/|https?://)[^"]+\.js' all_urls.txt | grep -Eiv '(jquery|bootstrap|react|vue|angular|popper|moment|chart\.?js|axios|lodash|vendor|vendors|polyfill|runtime|framework)[^/]*\.js' | anew jsfiles_filtered.txt
+mkdir -p jsfiles && sort -u jsfiles_filtered.txt -o jsfiles_filtered.txt
+if [[ -s jsfiles_filtered.txt ]]; then
+    aria2c -i jsfiles_filtered.txt -d jsfiles -j 6 -x 4 -s 4 --max-connection-per-server=4 --file-allocation=none --continue=true --max-tries=5 --retry-wait=10 --timeout=60 --auto-file-renaming=false --save-session=aria2-session.txt --save-session-interval=60 --summary-interval=60 --max-download-limit=500K --header="User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+fi
+
+# ==============================================================================
+# ACTIVE SCANNING — only when --active is passed
+# ==============================================================================
+if [[ "$ACTIVE" == true ]]; then
+    echo "[*] active mode: running nuclei"
+    nuclei -l hosts_alive.txt -t ~/nuclei-templates/ -severity critical,high,medium,low -json-export nuclei_findings.json
+    nuclei -t ~/nuclei-templates/http/cves -list hosts_alive.txt -json-export cves.json
+fi
+
+# ==============================================================================
+# CLEANUP
+# ==============================================================================
+find . -maxdepth 1 -type f -empty -delete

@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# changeip — Sequentially cycle through WireGuard VPN servers
+# Usage:
+#   changeip            — next server in sequence
+#   changeip US|JP|CA   — next server in that country
+#   changeip off        — disconnect
+#   changeip status     — show current connection
+# Servers dir: /home/aceos/Downloads/servers/
+# State file:  ~/.changeip_state
+
+SERVERS_DIR="/home/aceos/Downloads/servers"
+STATE_FILE="$HOME/.changeip_state"
+DNS_BACKUP="$HOME/.changeip_dns_backup"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+DIM='\033[2m'
+
+# ── Subcommand: help ──────────────────────────────────────────────────────────
+if [[ "${1,,}" == "help" || "$1" == "--help" || "$1" == "-h" || "$1" == "" && "${SHOW_HELP:-}" == "1" ]]; then
+  if [[ "${1,,}" == "help" || "$1" == "--help" || "$1" == "-h" ]]; then
+    echo ""
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}${CYAN}║          changeip — WireGuard VPN tool       ║${RESET}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+    echo ""
+    echo -e "  ${BOLD}USAGE${RESET}"
+    echo -e "    changeip ${DIM}[command | country]${RESET}"
+    echo ""
+    echo -e "  ${BOLD}COMMANDS${RESET}"
+    echo -e "    ${GREEN}(no args)${RESET}        Switch to the next server in sequence"
+    echo -e "    ${GREEN}<COUNTRY>${RESET}         Next server in that country  ${DIM}(e.g. US JP CA MX)${RESET}"
+    echo -e "    ${GREEN}off${RESET}               Disconnect from current VPN server"
+    echo -e "    ${GREEN}status${RESET}            Show current IP, location & tunnel name"
+    echo -e "    ${GREEN}help${RESET}, ${GREEN}-h${RESET}, ${GREEN}--help${RESET}   Show this help menu"
+    echo ""
+    echo -e "  ${BOLD}EXAMPLES${RESET}"
+    echo -e "    ${DIM}\$${RESET} changeip              ${DIM}# next server (any country)${RESET}"
+    echo -e "    ${DIM}\$${RESET} changeip US           ${DIM}# next US server${RESET}"
+    echo -e "    ${DIM}\$${RESET} changeip JP           ${DIM}# next Japan server${RESET}"
+    echo -e "    ${DIM}\$${RESET} changeip off          ${DIM}# disconnect${RESET}"
+    echo -e "    ${DIM}\$${RESET} changeip status       ${DIM}# check current connection${RESET}"
+    echo ""
+    echo -e "  ${BOLD}SERVERS DIR${RESET}"
+    echo -e "    /home/aceos/Downloads/servers/"
+    echo -e "    ${DIM}Drop new .conf files here — picked up automatically${RESET}"
+    echo ""
+    # Show available countries
+    AVAIL=$(find "/home/aceos/Downloads/servers" -maxdepth 1 -name "*.conf" 2>/dev/null \
+      -exec basename {} .conf \; | grep -oP '(?<=wg-)[A-Z]+(?=-)' | sort -u | tr '\n' ' ')
+    echo -e "  ${BOLD}AVAILABLE COUNTRIES${RESET}"
+    echo -e "    ${YELLOW}${AVAIL}${RESET}"
+    echo ""
+    exit 0
+  fi
+fi
+
+# ── Helper: find conf matching active wg interface ───────────────────────────
+find_active_conf() {
+  local active="$1"
+  find "$SERVERS_DIR" -maxdepth 1 -name "*.conf" 2>/dev/null | while read -r f; do
+    iface=$(basename "$f" .conf | sed 's/ (.*)//' | tr ' ' '-' | \
+            sed 's/[^a-zA-Z0-9_=+.-]/-/g' | cut -c1-15)
+    [[ "$iface" == "$active" ]] && echo "$f" && return
+  done
+}
+
+# ── Subcommand: off — disconnect ─────────────────────────────────────────────
+if [[ "${1,,}" == "off" ]]; then
+  ACTIVE=$(ip link show type wireguard 2>/dev/null | grep -oP '(?<=\d: )\S+(?=:)')
+  if [[ -z "$ACTIVE" ]]; then
+    echo -e "${YELLOW}⚡ Not connected.${RESET}"
+    exit 0
+  fi
+  ACTIVE_CONF=$(find_active_conf "$ACTIVE")
+  echo -e "${RED}⟳ Disconnecting:${RESET} $ACTIVE"
+  if [[ -n "$ACTIVE_CONF" ]]; then
+    sudo wg-quick down "$ACTIVE_CONF" 2>/dev/null
+  else
+    sudo ip link delete "$ACTIVE" 2>/dev/null
+  fi
+  # Restore DNS from backup so internet stays up
+  if [[ -f "$DNS_BACKUP" ]]; then
+    sudo cp "$DNS_BACKUP" /etc/resolv.conf
+    echo -e "  ${DIM}DNS restored from backup${RESET}"
+  else
+    # Fallback: use well-known public DNS temporarily
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf > /dev/null
+    echo -e "  ${YELLOW}No DNS backup found — using 1.1.1.1 temporarily${RESET}"
+  fi
+  # Clean up resolvconf state for the interface if we forcefully deleted it
+  sudo resolvconf -d "$ACTIVE" 2>/dev/null
+  echo -e "${GREEN}✔ Disconnected. Internet restored.${RESET}"
+  exit 0
+fi
+
+
+# ── Subcommand: status — show current IP & tunnel ────────────────────────────
+if [[ "${1,,}" == "status" ]]; then
+  ACTIVE=$(ip link show type wireguard 2>/dev/null | grep -oP '(?<=\d: )\S+(?=:)')
+  if [[ -z "$ACTIVE" ]]; then
+    echo -e "${YELLOW}⚡ VPN: Not connected${RESET}"
+    exit 0
+  fi
+  IP_INFO=$(curl -s --max-time 5 https://ipinfo.io 2>/dev/null)
+  IP=$(      echo "$IP_INFO" | grep '"ip"'      | cut -d'"' -f4)
+  CITY=$(    echo "$IP_INFO" | grep '"city"'    | cut -d'"' -f4)
+  REGION=$(  echo "$IP_INFO" | grep '"region"'  | cut -d'"' -f4)
+  COUNTRY=$( echo "$IP_INFO" | grep '"country"' | cut -d'"' -f4)
+  ORG=$(     echo "$IP_INFO" | grep '"org"'     | cut -d'"' -f4)
+  echo ""
+  echo -e "  ${GREEN}● VPN Active:${RESET} $ACTIVE"
+  echo -e "  ${BOLD}IP:${RESET}       ${GREEN}$IP${RESET}"
+  echo -e "  ${BOLD}Location:${RESET} $CITY, $REGION, $COUNTRY"
+  echo -e "  ${BOLD}Provider:${RESET} $ORG"
+  echo ""
+  exit 0
+fi
+
+# ── Check servers dir ─────────────────────────────────────────────────────────
+if [[ ! -d "$SERVERS_DIR" ]]; then
+  echo -e "${RED}✗ Servers directory not found:${RESET} $SERVERS_DIR"
+  exit 1
+fi
+
+# ── Build sorted server list (filter by country if arg given) ─────────────────
+FILTER="${1^^}"
+if [[ -n "$FILTER" ]]; then
+  mapfile -t CONFS < <(find "$SERVERS_DIR" -maxdepth 1 -name "wg-${FILTER}-*.conf" | sort)
+else
+  mapfile -t CONFS < <(find "$SERVERS_DIR" -maxdepth 1 -name "*.conf" | sort)
+fi
+
+if [[ ${#CONFS[@]} -eq 0 ]]; then
+  echo -e "${RED}✗ No configs found${RESET}${FILTER:+ for country: $FILTER}"
+  if [[ -n "$FILTER" ]]; then
+    echo -e "${YELLOW}Available countries:${RESET}"
+    find "$SERVERS_DIR" -maxdepth 1 -name "*.conf" -exec basename {} .conf \; | \
+      grep -oP '(?<=wg-)[A-Z]+(?=-)' | sort -u | xargs -I{} echo "  {}"
+  fi
+  exit 1
+fi
+
+TOTAL=${#CONFS[@]}
+
+# ── Read current index from state file ────────────────────────────────────────
+# State file format: "<last_conf_path>:<index>"
+CURRENT_IDX=0
+if [[ -f "$STATE_FILE" ]]; then
+  SAVED=$(cat "$STATE_FILE")
+  SAVED_IDX="${SAVED##*:}"
+  # Advance to the next index sequentially
+  CURRENT_IDX=$(( (SAVED_IDX + 1) % TOTAL ))
+fi
+
+# ── Disconnect any active wg interface ────────────────────────────────────────
+ACTIVE=$(ip link show type wireguard 2>/dev/null | grep -oP '(?<=\d: )\S+(?=:)')
+if [[ -n "$ACTIVE" ]]; then
+  echo -e "${YELLOW}⟳ Disconnecting:${RESET} $ACTIVE"
+  ACTIVE_CONF=$(find_active_conf "$ACTIVE")
+  if [[ -n "$ACTIVE_CONF" ]]; then
+    sudo wg-quick down "$ACTIVE_CONF" 2>/dev/null
+  else
+    sudo ip link delete "$ACTIVE" 2>/dev/null
+  fi
+fi
+
+# ── Select next server ────────────────────────────────────────────────────────
+NEW_CONF="${CONFS[$CURRENT_IDX]}"
+NAME=$(basename "$NEW_CONF" .conf)
+
+echo ""
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${CYAN}║     changeip — WireGuard VPN     ║${RESET}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════╝${RESET}"
+echo ""
+echo -e "  ${BOLD}Server:${RESET}   $NAME"
+echo -e "  ${BOLD}Position:${RESET} $(( CURRENT_IDX + 1 )) / $TOTAL"
+echo ""
+
+# ── Backup real DNS before connecting ───────────────────────────────────────
+# Grab DNS from NetworkManager (most reliable source of truth)
+NM_DNS=$(nmcli dev show 2>/dev/null | grep 'IP4.DNS' | awk '{print $2}' | head -3)
+if [[ -n "$NM_DNS" ]]; then
+  { echo "# changeip DNS backup"; echo "$NM_DNS" | while read -r d; do echo "nameserver $d"; done; } > "$DNS_BACKUP"
+else
+  # Fallback: snapshot current resolv.conf
+  sudo cp /etc/resolv.conf "$DNS_BACKUP" 2>/dev/null
+fi
+
+# ── Fix resolv.conf signature if needed ──────────────────────────────────────
+sudo resolvconf -u 2>/dev/null
+
+# ── Connect ───────────────────────────────────────────────────────────────────
+CONNECT_OUT=$(sudo wg-quick up "$NEW_CONF" 2>&1)
+CONNECT_EXIT=$?
+
+echo "$CONNECT_OUT" | grep -v "^Warning:"
+
+if [[ $CONNECT_EXIT -eq 0 ]]; then
+  # Save state
+  echo "${NEW_CONF}:${CURRENT_IDX}" > "$STATE_FILE"
+
+  # Fetch new IP info — retry loop until DNS is ready
+  echo ""
+  echo -ne "  Fetching IP info..."
+  IP_INFO=""
+  for i in {1..6}; do
+    IP_INFO=$(curl -s --max-time 4 https://ipinfo.io 2>/dev/null)
+    IP=$(echo "$IP_INFO" | grep '"ip"' | cut -d'"' -f4)
+    [[ -n "$IP" ]] && break
+    echo -ne " retrying($i)..."
+    sleep 1
+  done
+  echo ""
+  IP=$(      echo "$IP_INFO" | grep '"ip"'      | cut -d'"' -f4)
+  CITY=$(    echo "$IP_INFO" | grep '"city"'    | cut -d'"' -f4)
+  REGION=$(  echo "$IP_INFO" | grep '"region"'  | cut -d'"' -f4)
+  COUNTRY=$( echo "$IP_INFO" | grep '"country"' | cut -d'"' -f4)
+  ORG=$(     echo "$IP_INFO" | grep '"org"'     | cut -d'"' -f4)
+
+  NEXT_NAME=$(basename "${CONFS[$(( (CURRENT_IDX + 1) % TOTAL ))]}" .conf)
+
+  echo -e "  ${GREEN}✔ Connected!${RESET}"
+  echo ""
+  echo -e "  ${BOLD}IP:${RESET}       ${GREEN}$IP${RESET}"
+  echo -e "  ${BOLD}Location:${RESET} $CITY, $REGION, $COUNTRY"
+  echo -e "  ${BOLD}Provider:${RESET} $ORG"
+  echo ""
+  echo -e "  ${YELLOW}Next up:${RESET}  $NEXT_NAME"
+  echo ""
+else
+  echo -e "  ${RED}✗ Failed to connect.${RESET} Config: $NEW_CONF"
+  exit 1
+fi
+
+echo -e "  ${YELLOW}Tip:${RESET} Use ${BOLD}changeip US${RESET} / ${BOLD}changeip JP${RESET} / ${BOLD}changeip CA${RESET} to filter by country"
+echo ""
