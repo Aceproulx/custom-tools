@@ -62,6 +62,10 @@ if [[ -z "$TARGET" ]]; then
     exit 1
 fi
 
+OUTDIR="${TARGET}-recon"
+mkdir -p "$OUTDIR" && cd "$OUTDIR"
+echo "[*] output directory: $OUTDIR"
+
 # ==============================================================================
 # WILDCARD SUBDOMAIN ENUMERATION
 # REMOVE ALL THIS BLOCK IF THE DOMAIN IS NOT WILDCARD
