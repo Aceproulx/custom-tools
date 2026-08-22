@@ -3,6 +3,7 @@
 # Usage:
 #   changeip            — next server in sequence
 #   changeip US|JP|CA   — next server in that country
+#   changeip random     — switch to a random server
 #   changeip off        — disconnect
 #   changeip status     — show current connection
 # Servers dir: /home/aceos/Downloads/servers/
@@ -31,6 +32,7 @@ if [[ "${1,,}" == "help" || "$1" == "--help" || "$1" == "-h" || "$1" == "" && "$
     echo -e "  ${BOLD}COMMANDS${RESET}"
     echo -e "    ${GREEN}(no args)${RESET}        Switch to the next server in sequence"
     echo -e "    ${GREEN}<COUNTRY>${RESET}         Next server in that country  ${DIM}(e.g. US JP CA MX)${RESET}"
+    echo -e "    ${GREEN}random${RESET}            Switch to a random server ${DIM}(never the current one)${RESET}"
     echo -e "    ${GREEN}off${RESET}               Disconnect from current VPN server"
     echo -e "    ${GREEN}status${RESET}            Show current IP, location & tunnel name"
     echo -e "    ${GREEN}help${RESET}, ${GREEN}-h${RESET}, ${GREEN}--help${RESET}   Show this help menu"
@@ -39,6 +41,7 @@ if [[ "${1,,}" == "help" || "$1" == "--help" || "$1" == "-h" || "$1" == "" && "$
     echo -e "    ${DIM}\$${RESET} changeip              ${DIM}# next server (any country)${RESET}"
     echo -e "    ${DIM}\$${RESET} changeip US           ${DIM}# next US server${RESET}"
     echo -e "    ${DIM}\$${RESET} changeip JP           ${DIM}# next Japan server${RESET}"
+    echo -e "    ${DIM}\$${RESET} changeip random       ${DIM}# jump to a random server${RESET}"
     echo -e "    ${DIM}\$${RESET} changeip off          ${DIM}# disconnect${RESET}"
     echo -e "    ${DIM}\$${RESET} changeip status       ${DIM}# check current connection${RESET}"
     echo ""
@@ -126,6 +129,11 @@ fi
 
 # ── Build sorted server list (filter by country if arg given) ─────────────────
 FILTER="${1^^}"
+IS_RANDOM=0
+if [[ "${1,,}" == "random" ]]; then
+  IS_RANDOM=1
+  FILTER=""
+fi
 if [[ -n "$FILTER" ]]; then
   mapfile -t CONFS < <(find "$SERVERS_DIR" -maxdepth 1 -name "wg-${FILTER}-*.conf" | sort)
 else
@@ -147,10 +155,21 @@ TOTAL=${#CONFS[@]}
 # ── Read current index from state file ────────────────────────────────────────
 # State file format: "<last_conf_path>:<index>"
 CURRENT_IDX=0
+SAVED_IDX=0
+LAST_CONF=""
 if [[ -f "$STATE_FILE" ]]; then
   SAVED=$(cat "$STATE_FILE")
   SAVED_IDX="${SAVED##*:}"
-  # Advance to the next index sequentially
+  LAST_CONF="${SAVED%%:*}"
+fi
+
+if [[ $IS_RANDOM -eq 1 ]]; then
+  # Random pick — avoid reconnecting to the same server
+  CURRENT_IDX=$(( RANDOM % TOTAL ))
+  while [[ $TOTAL -gt 1 && "${CONFS[$CURRENT_IDX]}" == "$LAST_CONF" ]]; do
+    CURRENT_IDX=$(( RANDOM % TOTAL ))
+  done
+else
   CURRENT_IDX=$(( (SAVED_IDX + 1) % TOTAL ))
 fi
 
@@ -176,7 +195,11 @@ echo -e "${BOLD}${CYAN}║     changeip — WireGuard VPN     ║${RESET}"
 echo -e "${BOLD}${CYAN}╚══════════════════════════════════╝${RESET}"
 echo ""
 echo -e "  ${BOLD}Server:${RESET}   $NAME"
+if [[ $IS_RANDOM -eq 1 ]]; then
+echo -e "  ${BOLD}Picked:${RESET}   $(( CURRENT_IDX + 1 )) / $TOTAL (random)"
+else
 echo -e "  ${BOLD}Position:${RESET} $(( CURRENT_IDX + 1 )) / $TOTAL"
+fi
 echo ""
 
 # ── Backup real DNS before connecting ───────────────────────────────────────
@@ -235,5 +258,5 @@ else
   exit 1
 fi
 
-echo -e "  ${YELLOW}Tip:${RESET} Use ${BOLD}changeip US${RESET} / ${BOLD}changeip JP${RESET} / ${BOLD}changeip CA${RESET} to filter by country"
+echo -e "  ${YELLOW}Tip:${RESET} Use ${BOLD}changeip US${RESET} / ${BOLD}changeip JP${RESET} / ${BOLD}changeip random${RESET} to change servers"
 echo ""
