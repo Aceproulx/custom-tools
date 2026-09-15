@@ -1,5 +1,5 @@
 {
   "headed": true,
-  "args": "--disable-blink-features=AutomationControlled,--no-sandbox,--start-maximized",
-  "profile": "~/Projects/hackbot-misc/.agent-browser-profile"
+  "args": "--disable-blink-features=AutomationControlled,--start-maximized",
+  "profile": "/home/aceos/Projects/hackbot-misc/.agent-browser-profiles/Profile-userA"
 }

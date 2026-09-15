@@ -66,6 +66,21 @@ OUTDIR="${TARGET}-recon"
 mkdir -p "$OUTDIR" && cd "$OUTDIR"
 echo "[*] output directory: $OUTDIR"
 
+# fetch_json <url> <jq_filter> — retries until valid JSON, never fatal
+fetch_json() {
+    local url="$1" filter="$2" resp
+    for _ in 1 2 3; do
+        resp=$(curl -s --max-time 90 "$url")
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e "$filter" >/dev/null 2>&1; then
+            echo "$resp" | jq -r "$filter"
+            return 0
+        fi
+        sleep 5
+    done
+    echo "[!] json feed unavailable, skipping: $url" >&2
+    return 0
+}
+
 # ==============================================================================
 # WILDCARD SUBDOMAIN ENUMERATION
 # REMOVE ALL THIS BLOCK IF THE DOMAIN IS NOT WILDCARD
@@ -82,10 +97,10 @@ if [[ "$DOMAIN_MODE" == false ]]; then
     cat subfinder.txt amass.txt shodanx.txt assetfinder.txt gobuster.txt 2>/dev/null | sort -u | grep "\.$TARGET" | tee -a "subs_${TARGET}.txt"
     rm -f subfinder.txt amass.txt shodanx.txt assetfinder.txt gobuster.txt
 
-    curl -s "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | grep -Po '(\w+\.\w.\w+)$' | anew crtsh_subdomains.txt
-    curl -s "https://otx.alienvault.com/api/v1/indicators/hostname/$TARGET/passive_dns" | jq -r '.passive_dns[]?.hostname' | sort -u | tee -a alienvault_subs.txt
-    curl -s "https://urlscan.io/api/v1/search/?q=domain:$TARGET&size=10000" | jq -r '.results[]?.page?.domain' | sort -u | tee urlscan_subs.txt
-    curl -s "https://www.virustotal.com/vtapi/v2/domain/report?apikey=$VT_KEY&domain=$TARGET" | jq -r '.subdomains[]' | tee virustotal.txt
+    fetch_json "https://crt.sh/?q=%25.$TARGET&output=json" '.[].name_value' | grep -Po '(\w+\.\w.\w+)$' | anew crtsh_subdomains.txt
+    fetch_json "https://otx.alienvault.com/api/v1/indicators/hostname/$TARGET/passive_dns" '.passive_dns[]?.hostname' | sort -u | tee -a alienvault_subs.txt
+    fetch_json "https://urlscan.io/api/v1/search/?q=domain:$TARGET&size=10000" '.results[]?.page?.domain' | sort -u | tee urlscan_subs.txt
+    fetch_json "https://www.virustotal.com/vtapi/v2/domain/report?apikey=$VT_KEY&domain=$TARGET" '.subdomains[]' | tee virustotal.txt
 
     cat "subs_${TARGET}.txt" alienvault_subs.txt virustotal.txt urlscan_subs.txt crtsh_subdomains.txt 2>/dev/null | sort -u | grep "$TARGET" | tee -a all_subdomains.txt
     rm -f "subs_${TARGET}.txt" crtsh_subdomains.txt alienvault_subs.txt urlscan_subs.txt virustotal.txt
@@ -105,7 +120,7 @@ cat httpx_findings.txt | grep -Ei 'old|asp|php|jsp|jspx|aspx' | tee subs-commonl
 cat httpx_findings.txt | awk '{print $1}' | tee hosts_alive.txt
 cat hosts_alive.txt | grep -E "admin|panel|portal|secure|dashboard|internal|api" | tee important_subdomains.txt
 
-waymore -i "$TARGET" -mode U -oU waymore.txt
+waymore -i "$TARGET" -mode U -oU waymore.txt -xus -xvt
 cat hosts_alive.txt | gau | tee gaurls.txt
 cat hosts_alive.txt | gauplus -subs -b png,jpg,gif,jpeg,swf,woff,gif,svg -o gauplus.txt
 katana -list hosts_alive.txt -d 7 | tee katana.txt
