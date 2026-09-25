@@ -16,10 +16,12 @@ MAX_PASSES="${MAX_PASSES:-80}"
 SCROLL_PIXELS="${SCROLL_PIXELS:-900}"
 STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/.sent_hi_names}"
 LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/.sent_hi.log}"
+LOCK_FILE="${LOCK_FILE:-$SCRIPT_DIR/.send_hi_all.lock}"
 
 declare -a SKIP_NAMES=()
 declare -A processed=()
 declare -A skipped=()
+declare -A sent_names=()
 
 usage() {
   cat <<'EOF'
@@ -31,7 +33,7 @@ Options:
   --session SESSION      agent-device session (default: cwd:9bd7e06eb732281e:default).
   --message TEXT         Greeting to type (default: hi).
   --skip NAME            Do not process NAME; may be repeated.
-  --state-file PATH      Successful-name state file.
+  --state-file PATH      Sent-name registry; names here are never sent again.
   --log-file PATH        Per-target log file.
   --max-passes N         Maximum scroll passes (default: 80).
   --scroll-pixels N      Scroll distance per pass (default: 900).
@@ -78,6 +80,39 @@ mark_processed() { processed["$(key_for "$1")"]=1; }
 is_processed() { [[ -n "${processed[$(key_for "$1")]+present}" ]]; }
 mark_skipped() { skipped["$(key_for "$1")"]=1; }
 is_skipped() { [[ -n "${skipped[$(key_for "$1")]+present}" ]]; }
+mark_sent() { sent_names["$(key_for "$1")"]=1; }
+is_sent() { [[ -n "${sent_names[$(key_for "$1")]+present}" ]]; }
+
+# Re-read the registry immediately before a send as well as during startup.
+# This protects against a second process or a manually updated state file.
+state_contains() {
+  local wanted saved=""
+  wanted="$(key_for "$1")"
+  [[ -f "$STATE_FILE" ]] || return 1
+  while IFS= read -r saved || [[ -n "$saved" ]]; do
+    [[ -n "$saved" ]] || continue
+    if [[ "$(key_for "$saved")" == "$wanted" ]]; then
+      return 0
+    fi
+  done < "$STATE_FILE"
+  return 1
+}
+
+record_sent() {
+  local name="$1"
+  if state_contains "$name"; then
+    mark_sent "$name"
+    mark_skipped "$name"
+    return 0
+  fi
+  if ! printf '%s\n' "$name" >> "$STATE_FILE"; then
+    log_line "ERROR\t$name\tcould not write sent-name registry"
+    return 1
+  fi
+  mark_sent "$name"
+  mark_skipped "$name"
+  return 0
+}
 
 for name in "${SKIP_NAMES[@]}"; do
   mark_skipped "$name"
@@ -85,8 +120,25 @@ done
 
 if [[ -f "$STATE_FILE" ]]; then
   while IFS= read -r saved_name || [[ -n "$saved_name" ]]; do
-    [[ -n "$saved_name" ]] && mark_skipped "$saved_name"
+    [[ -n "$saved_name" ]] || continue
+    mark_sent "$saved_name"
+    mark_skipped "$saved_name"
   done < "$STATE_FILE"
+fi
+
+# Prevent two copies of the script from sending to the same contact at once.
+if command -v flock >/dev/null 2>&1; then
+  if ! exec 9>"$LOCK_FILE"; then
+    echo "Unable to create lock file: $LOCK_FILE" >&2
+    exit 1
+  fi
+  if ! flock -n 9; then
+    echo "Another send_hi_all.sh run is active; refusing to start." >&2
+    exit 1
+  fi
+elif [[ "$MODE" == "execute" ]]; then
+  echo "flock is required for execute mode; refusing to risk duplicate sends." >&2
+  exit 1
 fi
 
 run_ad() {
@@ -178,6 +230,21 @@ return_to_list() {
 
 send_one() {
   local name="$1" x="$2" y="$3"
+
+  # Re-check the durable registry immediately before opening a profile. The
+  # in-memory map handles duplicates in this run; this check handles reruns and
+  # an operator manually updating the registry.
+  if is_sent "$name" || state_contains "$name"; then
+    mark_sent "$name"
+    mark_skipped "$name"
+    printf 'SKIP\t%s\talready recorded as sent\n' "$name"
+    return 0
+  fi
+  if is_skipped "$name" || is_processed "$name"; then
+    printf 'SKIP\t%s\talready skipped or processed\n' "$name"
+    return 0
+  fi
+
   mark_processed "$name"
   log_line "START\t$name\t($x,$y)"
 
@@ -222,23 +289,29 @@ send_one() {
     return 1
   fi
 
+  # Record the contact as sent immediately after Send returns successfully.
+  # Even if navigation or the process is interrupted next, a later run will
+  # still refuse to send to this person again.
+  if ! record_sent "$name"; then
+    log_line "ERROR\t$name\tmessage was sent but the sent-name registry could not be updated"
+    return 1
+  fi
+  printf 'SENT\t%s\n' "$name"
+
   # The normal flow returns to the profile after Send. If the list is already
   # visible, do not press Back; otherwise click Back exactly once, then verify
   # that the People Nearby list is ready for the next contact.
   run_ad wait stable 500 10000 >/dev/null 2>&1 || true
   if ! run_ad is visible 'label="People Nearby"' >/dev/null 2>&1; then
     if ! run_ad back >/dev/null 2>&1; then
-      log_line "ERROR\t$name\tBack after Send failed"
+      log_line "WARN\t$name\tsent and recorded, but Back failed"
       return 1
     fi
   fi
   if ! run_ad wait text 'People Nearby' 10000 >/dev/null 2>&1; then
-    log_line "ERROR\t$name\tPeople Nearby did not return after Back"
+    log_line "WARN\t$name\tsent and recorded, but People Nearby could not be verified"
     return 1
   fi
-
-  printf 'SENT\t%s\n' "$name"
-  printf '%s\n' "$name" >> "$STATE_FILE"
   return 0
 }
 
