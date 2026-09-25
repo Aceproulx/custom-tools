@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ghsearch — search GitHub by keyword, filter results with regex
+# ------------------------------------------------------------------------------
+# Usage:
+#   ghsearch tokenization                    # repos + code mentioning keyword
+#   ghsearch tokenization "tokeni[sz]ation"  # filter results with regex
+#   ghsearch tokenization "\.(py|js)$"       # only Python/JS files
+#   ghsearch tokenization "tokenizer" --code # code results only
+#   ghsearch tokenization "tokenizer" --repos
+#   ghsearch tokenization "tokenizer" --issues
+#   ghsearch tokenization "tokenizer" --users
+#
+# Notes:
+#   - GitHub's own search has NO regex support; results are fetched with `gh`
+#     and filtered locally with jq's test() (Go regexp, case-insensitive).
+#   - Regex applies to fetched results only (max 100 per query).
+#   - Requires: gh (authenticated), jq
+# ==============================================================================
+
+set -euo pipefail
+
+TERM=""
+REGEX="."
+LIMIT=100
+MODE="all"   # all | repos | code | issues | users
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'; DIM='\033[2m'
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        --repos)  MODE="repos" ;;
+        --code)   MODE="code" ;;
+        --issues) MODE="issues" ;;
+        --users)  MODE="users" ;;
+        --limit)  LIMIT="$2"; shift ;;
+        -*)       echo -e "${RED}Unknown option: $1${RESET}"; usage ;;
+        *)
+            if [[ -z "$TERM" ]]; then TERM="$1"
+            elif [[ "$REGEX" == "." ]]; then REGEX="$1"
+            else echo -e "${RED}Too many arguments${RESET}"; usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[[ -z "$TERM" ]] && { echo -e "${RED}Missing search term${RESET}"; usage; }
+
+command -v gh >/dev/null || { echo -e "${RED}gh not found${RESET}"; exit 1; }
+command -v jq >/dev/null || { echo -e "${RED}jq not found${RESET}"; exit 1; }
+
+# ── Search ────────────────────────────────────────────────────────────────────
+echo -e "${BOLD}${CYAN}ghsearch:${RESET} ${BOLD}'$TERM'${RESET} ${DIM}regex: /$REGEX/i${RESET}"
+
+if [[ "$MODE" == "all" || "$MODE" == "repos" ]]; then
+    echo -e "\n${BOLD}== REPOS ==${RESET}"
+    gh search repos "$TERM" --limit "$LIMIT" --json fullName,description \
+        | jq -r --arg re "$REGEX" \
+            '.[] | select(.description // "" | test($re; "i")) | .fullName' \
+        | head -20
+fi
+
+if [[ "$MODE" == "all" || "$MODE" == "code" ]]; then
+    echo -e "\n${BOLD}== CODE ==${RESET}"
+    gh search code "$TERM" --limit "$LIMIT" --json repository,path \
+        | jq -r --arg re "$REGEX" \
+            '.[] | select(.path | test($re; "i")) | "\(.repository.nameWithOwner) — \(.path)"' \
+        | head -20
+fi
+
+if [[ "$MODE" == "all" || "$MODE" == "issues" ]]; then
+    echo -e "\n${BOLD}== ISSUES/PRs ==${RESET}"
+    gh search issues "$TERM" --limit "$LIMIT" --json number,title,repository \
+        | jq -r --arg re "$REGEX" \
+            '.[] | select(.title | test($re; "i")) | "#\(.number) \(.title[0:60]) — \(.repository.nameWithOwner)"' \
+        | head -20
+fi
+
+if [[ "$MODE" == "all" || "$MODE" == "users" ]]; then
+    echo -e "\n${BOLD}== USERS ==${RESET}"
+    # gh search has no `users` subcommand — use the API directly
+    # (search/users returns login only; bio requires a per-user fetch)
+    gh api "search/users?q=$TERM&per_page=$LIMIT" --jq '.items' \
+        | jq -r --arg re "$REGEX" \
+            '.[] | select(.login | test($re; "i")) | .login' \
+        | head -20
+fi
+
+echo -e "\n${DIM}Rate limit remaining: $(gh api rate_limit --jq '.rate.remaining')${RESET}"

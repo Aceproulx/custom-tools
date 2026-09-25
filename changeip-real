@@ -281,4 +281,3 @@ fi
 
 echo -e "  ${YELLOW}Tip:${RESET} Use ${BOLD}changeip US${RESET} / ${BOLD}changeip JP${RESET} / ${BOLD}changeip random${RESET} to change servers"
 echo ""
-
