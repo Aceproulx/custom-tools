@@ -10,7 +10,7 @@ set -uo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 AD_BIN="${AGENT_DEVICE_BIN:-agent-device}"
 SESSION="${AGENT_DEVICE_SESSION:-cwd:9bd7e06eb732281e:default}"
-MESSAGE="hi"
+MESSAGE="berepa 30 menit"
 MODE="dry-run"
 MAX_PASSES="${MAX_PASSES:-80}"
 SCROLL_PIXELS="${SCROLL_PIXELS:-900}"
@@ -317,8 +317,7 @@ send_one() {
 
 # Start at the top so the traversal is repeatable.
 if ! run_ad is visible 'label="People Nearby"' >/dev/null 2>&1; then
-  echo "The active screen is not People Nearby; start Mitchat there first." >&2
-  exit 1
+  echo "The ad button is not visible" >&2
 fi
 run_ad scroll top >/dev/null 2>&1 || true
 run_ad wait stable 500 10000 >/dev/null 2>&1 || true

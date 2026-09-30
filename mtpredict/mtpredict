@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+mtpredict - recover Python's `random` (Mersenne Twister MT19937) internal state
+from 624 consecutive 32-bit outputs, then predict the values that come next.
+
+    mtpredict 624_numbers.txt --guess 100
+
+Predictions go to stdout, one per line, so the tool pipes cleanly. The report
+goes to stderr. Use --quiet to silence the report.
+
+The state recovery is implemented here directly (untemper + twist inverse
+reconstruction), so this script has zero third-party dependencies. It is the
+same technique Erik Bosman published in 2013 and that `pip install randcrack`
+wraps.
+
+Legitimate uses: auditing your own code for weak randomness, CTFs, security
+research, forensics. Not for attacking systems you are not authorised to test.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+__version__ = "1.0.0"
+
+# --- MT19937 parameters (fixed by the algorithm) -----------------------------
+N = 624
+M = 397
+MATRIX_A = 0x9908B0DF
+UPPER_MASK = 0x80000000
+LOWER_MASK = 0x7FFFFFFF
+MASK32 = 0xFFFFFFFF
+
+PROG = os.path.basename(sys.argv[0]) or "mtpredict"
+
+
+# --- The algorithm ------------------------------------------------------------
+def _invert_masked_left_shift(b: int, s: int, mask: int) -> int:
+    """Invert `y ^= (y << s) & mask`.
+
+    Forward, bit i of the result is  b_i = a_i ^ (a_{i-s} & mask_i), with
+    a_{i-s} treated as 0 below s. That is triangular: solving for a_i in
+    ascending bit order makes each a_{i-s} already known, so one upward pass
+    recovers the input exactly. (Simply re-applying the forward operation
+    does *not* converge to the inverse here -- the mask breaks it.)
+    """
+    a = 0
+    for i in range(32):
+        bit = (b >> i) & 1
+        if i >= s and (mask >> i) & 1:
+            bit ^= (a >> (i - s)) & 1
+        a |= bit << i
+    return a & MASK32
+
+
+def temper(y: int) -> int:
+    """MT19937's output tempering (forward direction)."""
+    y ^= y >> 11
+    y ^= (y << 7) & 0x9D2C5680
+    y ^= (y << 15) & 0xEFC60000
+    y ^= y >> 18
+    return y & MASK32
+
+
+def untemper(y: int) -> int:
+    """Invert MT19937's output tempering, recovering the raw state word.
+
+    Forward tempering is:
+        y ^= y >> 11
+        y ^= (y <<  7) & 0x9D2C5680
+        y ^= (y << 15) & 0xEFC60000
+        y ^= y >> 18
+
+    Undo each step in reverse order:
+      * the right shifts are order-2/order-4 xor-shifts, so they undo by
+        re-applying themselves the right number of times -- `>>18` is its own
+        inverse (1 application), `>>11` has order 4 so it needs 3 (which
+        collapses to `x ^= x>>11; x ^= x>>22`).
+      * the masked left shifts need the triangular bit solve above.
+    """
+    y ^= y >> 18                                    # self-inverse
+    y = _invert_masked_left_shift(y, 15, 0xEFC60000)
+    y = _invert_masked_left_shift(y, 7, 0x9D2C5680)
+    y ^= y >> 11                                    # 3 applications
+    y ^= y >> 22
+    return y & MASK32
+
+
+class MT19937:
+    """A reconstructed MT19937 generator positioned to emit the *next* value."""
+
+    def __init__(self, untempered_state):
+        if len(untempered_state) != N:
+            raise ValueError(f"state must be exactly {N} words, got {len(untempered_state)}")
+        self.mt = list(untempered_state)
+        # The 624 recovered words are the state *as it stood while those 624
+        # values were being emitted*, so the read cursor now sits at the end
+        # of the block -- exactly like CPython's index after 624 calls. Setting
+        # it to N is what forces the next read to twist first, i.e. to move
+        # forward rather than replay the observed values back at us.
+        self.index = N
+
+    @classmethod
+    def from_outputs(cls, outputs):
+        """Rebuild the generator from 624 consecutive 32-bit outputs."""
+        return cls([untemper(v) for v in outputs])
+
+    def _twist(self):
+        """Advance the state by one full 624-word block (index_genrand)."""
+        for i in range(N):
+            y = (self.mt[i] & UPPER_MASK) | (self.mt[(i + 1) % N] & LOWER_MASK)
+            self.mt[i] = self.mt[(i + M) % N] ^ (y >> 1) ^ (MATRIX_A if y & 1 else 0)
+        self.index = 0
+
+    def next32(self) -> int:
+        if self.index >= N:
+            self._twist()
+        y = self.mt[self.index]
+        self.index += 1
+        return temper(y)
+
+    def next_many(self, count: int):
+        return [self.next32() for _ in range(count)]
+
+
+# --- Input parsing ------------------------------------------------------------
+_INT_RE = re.compile(r"-?\d+")
+
+
+def parse_numbers(text: str, source: str):
+    """Pull integers out of loosely formatted text.
+
+    Accepts one-per-line, space/comma separated, JSON-ish lists, quoted
+    numbers, and # comments. Sign is tolerated; values are wrapped to 32 bits.
+    """
+    values = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0]
+        for token in _INT_RE.findall(line):
+            value = int(token) & MASK32
+            values.append((value, f"{source}:{lineno}"))
+
+    if not values:
+        raise ValueError(f"no numbers found in {source}")
+
+    return [v for v, _ in values]
+
+
+def read_input(path: str):
+    """Read and parse the observation file. '-' means stdin."""
+    if path == "-":
+        return parse_numbers(sys.stdin.read(), "<stdin>")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return parse_numbers(handle.read(), path)
+    except FileNotFoundError:
+        raise ValueError(f"no such file: {path}") from None
+    except IsADirectoryError:
+        raise ValueError(f"not a file: {path}") from None
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc.strerror}") from None
+
+
+def check_looks_like_uint32(values, threshold: int = 64):
+    """Reject input that cannot be `getrandbits(32)` output.
+
+    Every genuine MT19937 word is uniform over 0..2**32-1, so all 32 bit
+    positions get set roughly half the time. A bit that is never set across
+    `threshold` or more samples is therefore not luck - the chance of it is
+    2**-threshold, which for 64+ samples is smaller than a hardware error rate.
+
+    This catches the common mistake of feeding the tool output from something
+    like `random.randint(100000, 999999)`: those values are 6 digits, so bits
+    20-31 are structurally zero, and the "recovered" state is nonsense.
+    """
+    if len(values) < threshold:
+        return None
+    dead = [b for b in range(32) if not any(v >> b & 1 for v in values)]
+    if not dead:
+        return None
+    lo, hi = min(dead), max(dead)
+    span = hi - lo + 1
+    return {
+        "dead": dead,
+        "width": max(values).bit_length(),
+        "max": max(values),
+        "count": len(values),
+        "lo": lo,
+        "hi": hi,
+        "span": span,
+    }
+
+
+def format_uint32_problem(info) -> str:
+    """Render an actionable explanation for bad input."""
+    dead = info["dead"]
+    lo, hi, span = info["lo"], info["hi"], info["span"]
+    lines = [
+        f"input does not look like getrandbits(32) output: "
+        f"bit position{'s' if len(dead) > 1 else ''} "
+        f"{_fmt_bit_range(dead)} never set across {info['count']} values",
+        "",
+    ]
+    if lo >= 20 and info["max"] < 1_000_000:
+        lines += [
+            f"  every value is below 1,000,000 (max {info['max']}), i.e. 6-digit "
+            f"numbers.",
+            "  That is output from random.randint(100000, 999999) or",
+            "  random.randrange(...), not from random.getrandbits(32).",
+            "",
+            "  Two separate problems:",
+            "    1. 6-digit values are not 32-bit generator output, so the state",
+            "       recovered from them is meaningless.",
+            "    2. randrange() draws 20 bits and REDRAWS when the draw misses",
+            "       the range (~14% of the time), so it consumes a variable",
+            "       number of state words. The numbers are not a contiguous",
+            "       32-bit stream even in principle.",
+        ]
+    elif lo >= 24:
+        lines += [
+            f"  all values fit in {info['width']} bits (max {info['max']}), but "
+            f"getrandbits(32)",
+            "  always returns the full 32-bit range.",
+            "  Likely output from a narrower function - getrandbits(k) for "
+            "small k,",
+            "  randrange(), or a truncated/derived value.",
+        ]
+    else:
+        lines += [
+            f"  bits {_fmt_bit_range(dead)} are never set, which uniform "
+            f"32-bit output",
+            "  cannot do. The values may be scaled, masked, reordered, or not",
+            "  consecutive outputs of one generator.",
+        ]
+    lines += [
+        "",
+        "  Predictions were NOT produced, because any would be fiction.",
+        "",
+        "  Capture the state directly instead:",
+        "    python3 -c \"import random;f=open('624.txt','w');"
+        "[f.write(str(random.getrandbits(32))+'\\n') for _ in range(624)]\"",
+        "",
+        "  See README.md and INSECURE-RANDOMNESS.md for the details.",
+    ]
+    return "\n".join(lines)
+
+
+def _fmt_bit_range(bits) -> str:
+    """Render a sorted bit list compactly, e.g. '20-31' or '3, 7, 11'."""
+    if not bits:
+        return "-"
+    bits = sorted(bits)
+    runs, start, prev = [], bits[0], bits[0]
+    for b in bits[1:]:
+        if b == prev + 1:
+            prev = b
+            continue
+        runs.append((start, prev))
+        start = prev = b
+    runs.append((start, prev))
+    return ", ".join(f"{a}" if a == b else f"{a}-{b}" for a, b in runs)
+
+
+def select_window(values, use_head: bool):
+    """Pick 624 consecutive values out of the observation set.
+
+    With more than 624 numbers, every aligned block of 624 gives the state at
+    that point. The last block predicts furthest into the future, so it is the
+    default; --head takes the first block instead.
+    """
+    if len(values) == N:
+        return values, None
+    if len(values) < N:
+        raise ValueError(
+            f"need at least {N} numbers, got {len(values)} "
+            f"({N - len(values)} short of a full state)"
+        )
+    window = values[:N] if use_head else values[-N:]
+    which = "first" if use_head else "last"
+    return window, f"{len(values)} numbers supplied; using the {which} {N}"
+
+
+# --- Self-test / demo ---------------------------------------------------------
+def selftest(trials: int = 5, verbose: bool = True) -> bool:
+    """Prove the recovery works against CPython's real generator."""
+    import random
+
+    ok = True
+    for trial in range(1, trials + 1):
+        seed = random.getrandbits(64)  # unpredictable trial seed
+        random.seed(seed)
+        observed = [random.getrandbits(32) for _ in range(N)]
+
+        recovered = MT19937.from_outputs(observed)
+        predicted = recovered.next_many(10)
+
+        # Ground truth must be the *continuation of this same live stream*,
+        # not a freshly seeded instance -- a fresh instance replays the stream
+        # from the start, which would make a generator that merely echoes its
+        # inputs look correct.
+        expected = [random.getrandbits(32) for _ in range(10)]
+
+        match = predicted == expected
+        # guard against the replay-echo failure mode explicitly
+        if match and predicted[0] in observed:
+            print("  replay-echo detected (predicted an input)", file=sys.stderr)
+            match = False
+        ok = ok and match
+        if verbose:
+            status = "PASS" if match else "FAIL"
+            detail = "" if match else f"\n     predicted={predicted}\n     expected ={expected}"
+            print(f"  trial {trial}/{trials}  seed={seed:<20} {status}{detail}", file=sys.stderr)
+
+    # untemper must be a true inverse of temper
+    words = [random.getrandbits(32) for _ in range(1000)]
+    if any(untemper(temper(w)) != w for w in words):
+        print("  untemper/temper round-trip (1000 words)  FAIL", file=sys.stderr)
+        return False
+    if verbose:
+        print("  untemper/temper round-trip (1000 words)  PASS", file=sys.stderr)
+        print("  masked left-shift inverse                 PASS", file=sys.stderr)
+
+    return ok
+
+
+def write_demo(path: str, count: int = N) -> None:
+    """Write a sample observation file captured from a live `random` stream."""
+    import random
+
+    random.seed()
+    lines = [
+        "# Sample MT19937 observation captured from Python's random module.",
+        f"# Produced by: mtpredict --demo   ({count} consecutive getrandbits(32) values)",
+        "# Feed this file back into mtpredict to predict the following values.",
+        "",
+    ]
+    for i in range(0, count, 4):
+        chunk = [str(random.getrandbits(32)) for _ in range(min(4, count - i))]
+        lines.append(" ".join(chunk))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+# --- CLI ----------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description=(
+            "Recover Python's random (MT19937) state from 624 consecutive "
+            "32-bit outputs and predict subsequent values."
+        ),
+        epilog=(
+            "example:\n"
+            f"  {PROG} 624_numbers.txt --guess 100   predict the next 100 values\n"
+            f"  {PROG} capture.txt --guess 10 --out predicted.txt\n"
+            f"  {PROG} --demo                        write a fresh sample file\n"
+            f"  {PROG} --selftest                    verify against real random\n"
+            "\n"
+            "The 624 numbers must be consecutive outputs of getrandbits(32).\n"
+            "Floats from random.random(), or values from randrange/randint/choice,\n"
+            "consume a variable number of state words and will desynchronise recovery."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        help="file containing the 624 observed numbers ('-' reads stdin)",
+    )
+    parser.add_argument(
+        "-g", "--guess", type=int, default=10, metavar="N",
+        help="how many values to predict (default: 10)",
+    )
+    parser.add_argument(
+        "-o", "--out", metavar="FILE",
+        help="write predictions to FILE instead of stdout",
+    )
+    parser.add_argument(
+        "--head", action="store_true",
+        help="when the file holds more than 624 numbers, use the first 624 "
+             "instead of the last 624 (last predicts furthest ahead)",
+    )
+    parser.add_argument(
+        "--demo", metavar="FILE", nargs="?", const="624_numbers.txt",
+        help="write a fresh sample observation file to FILE "
+             "(default: 624_numbers.txt) and exit",
+    )
+    parser.add_argument(
+        "--selftest", action="store_true",
+        help="verify the state recovery against CPython's generator and exit",
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true", help="suppress the stderr report",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="predict even if the input fails the getrandbits(32) sanity "
+             "check (bit positions that are never set). Results will be "
+             "meaningless unless you know better than the check does",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def run(argv) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    def report(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    # --- standalone modes ---
+    if args.selftest:
+        print(f"{PROG} {__version__} self-test", file=sys.stderr)
+        if selftest():
+            print("self-test: all checks passed", file=sys.stderr)
+            return 0
+        print("self-test: FAILED", file=sys.stderr)
+        return 1
+
+    if args.demo is not None:
+        try:
+            write_demo(args.demo)
+        except OSError as exc:
+            print(f"{PROG}: cannot write {args.demo}: {exc.strerror}", file=sys.stderr)
+            return 2
+        print(f"{PROG}: wrote {N} sample values to {args.demo}", file=sys.stderr)
+        print(f"{PROG}: try  {PROG} {args.demo} --guess 100", file=sys.stderr)
+        return 0
+
+    if args.file is None:
+        parser.print_help(sys.stderr)
+        print(f"\n{PROG}: error: no input file given", file=sys.stderr)
+        return 1
+
+    if args.guess < 0:
+        print(f"{PROG}: error: --guess must be zero or greater", file=sys.stderr)
+        return 1
+    if args.guess == 0:
+        report("nothing to predict (--guess 0)")
+        return 0
+
+    # --- main path ---
+    try:
+        values = read_input(args.file)
+    except ValueError as exc:
+        print(f"{PROG}: error: {exc}", file=sys.stderr)
+        return 2
+
+    # --- reject input that cannot be 32-bit generator output ---
+    # Do this before touching the window, so a bad file is never half-processed.
+    problem = check_looks_like_uint32(values)
+    if problem is not None and not args.force:
+        print(f"{PROG}: error: {format_uint32_problem(problem)}", file=sys.stderr)
+        print(
+            f"{PROG}: (--force to predict anyway; the result will be meaningless)",
+            file=sys.stderr,
+        )
+        return 4
+
+    try:
+        window, note = select_window(values, args.head)
+    except ValueError as exc:
+        print(f"{PROG}: error: {exc}", file=sys.stderr)
+        print(
+            f"{PROG}: hint: capture with 'random.getrandbits(32)' in a loop, "
+            f"one value per line.",
+            file=sys.stderr,
+        )
+        return 3
+
+    if note:
+        report(f"{PROG}: {note}")
+
+    generator = MT19937.from_outputs(window)
+    predicted = generator.next_many(args.guess)
+
+    destination = args.out or "-"
+    try:
+        if destination == "-":
+            sys.stdout.write("".join(f"{v}\n" for v in predicted))
+            sys.stdout.flush()
+        else:
+            with open(destination, "w", encoding="utf-8") as handle:
+                handle.write("".join(f"{v}\n" for v in predicted))
+    except OSError as exc:
+        print(f"{PROG}: cannot write output: {exc.strerror}", file=sys.stderr)
+        return 2
+
+    report(
+        f"{PROG}: state recovered from {N} words"
+        + (f", wrote {args.guess} value(s) to {destination}"
+           if destination != "-" else
+           f", predicted {args.guess} value(s) on stdout")
+    )
+    return 0
+
+
+def main() -> int:
+    try:
+        return run(sys.argv[1:])
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    except BrokenPipeError:
+        # downstream closed the pipe (e.g. `| head`); not an error
+        try:
+            sys.stdout.close()
+        except BrokenPipeError:
+            pass
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

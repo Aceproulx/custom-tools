@@ -1,1 +1,6 @@
+click.sh
+*.log
+*.swp
+.sent_hi_names
+*.lock
 financial/paychangu/apikeys.txt
